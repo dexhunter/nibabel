@@ -1783,21 +1783,71 @@ class Nifti1Header(SpmAnalyzeHeader):
                 raise HeaderDataError('Cannot have None in middle of slice time vector')
         # Find slice duration, check times are compatible with single
         # duration
-        tdiffs = np.diff(np.sort(timed))
-        if not np.allclose(np.diff(tdiffs), 0):
+        sorted_timed = np.sort(timed)
+        if type(sorted_timed) is np.ndarray and sorted_timed.dtype.kind == 'f':
+            tdiffs = sorted_timed[..., 1:] - sorted_timed[..., :-1]
+            differences = tdiffs[..., 1:] - tdiffs[..., :-1]
+        else:
+            tdiffs = np.diff(sorted_timed)
+            differences = np.diff(tdiffs)
+        if type(differences) is np.ndarray and differences.dtype.kind == 'f':
+            with np.errstate(invalid='ignore'):
+                compatible = (np.abs(differences) <= 1e-8).all()
+        else:
+            compatible = np.allclose(differences, 0)
+        if not compatible:
             raise HeaderDataError('Slice times not compatible with single slice duration')
-        duration = np.mean(tdiffs)
+        duration = tdiffs.mean() if type(tdiffs) is np.ndarray else np.mean(tdiffs)
         # To slice time order
-        st_order = np.round(np.array(timed) / duration)
+        if type(timed) is np.ndarray and timed.dtype.kind in 'biufc':
+            st_order = (timed / duration).round()
+        else:
+            st_order = np.round(np.array(timed) / duration)
         # Check if slice times fit known schemes
         n_timed = len(timed)
         so_recoder = self._field_recoders['slice_code']
         labels = so_recoder.value_set('label')
         labels.remove('unknown')
 
-        matching_labels = [
-            label for label in labels if np.all(st_order == self._slice_time_order(label, n_timed))
-        ]
+        matching_labels = []
+        if (
+            type(self) is Nifti1Header
+            and getattr(self._slice_time_order, '__func__', None) is Nifti1Header._slice_time_order
+            and type(st_order) is np.ndarray
+            and st_order.ndim == 1
+            and st_order.dtype.kind == 'f'
+        ):
+            # Share rank lists across schemes and reverse them for decreasing orders.
+            order = st_order.tolist()
+            increasing = list(range(n_timed))
+            alternating = [0] * n_timed
+            half = (n_timed + 1) // 2
+            alternating[::2] = increasing[:half]
+            alternating[1::2] = increasing[half:]
+            alternating2 = [0] * n_timed
+            half = n_timed // 2
+            alternating2[1::2] = increasing[:half]
+            alternating2[::2] = increasing[half:]
+            orders = {
+                'sequential increasing': increasing,
+                'sequential decreasing': increasing[::-1],
+                'alternating increasing': alternating,
+                'alternating decreasing': alternating[::-1],
+                'alternating increasing 2': alternating2,
+                'alternating decreasing 2': alternating2[::-1],
+            }
+            for label in labels:
+                expected = orders.get(label)
+                if expected is None:
+                    expected = self._slice_time_order(label, n_timed).tolist()
+                if order == expected:
+                    matching_labels.append(label)
+        else:
+            for label in labels:
+                matches = st_order == self._slice_time_order(label, n_timed)
+                matches = matches.all() if type(matches) is np.ndarray else np.all(matches)
+                if matches:
+                    matching_labels.append(label)
 
         if not matching_labels:
             raise HeaderDataError(f'slice ordering of {st_order} fits with no known scheme')
@@ -1816,24 +1866,33 @@ class Nifti1Header(SpmAnalyzeHeader):
     def _slice_time_order(self, slabel, n_slices):
         """Supporting function to give time order of slices from label"""
         if slabel == 'sequential increasing':
-            sp_ind_time_order = list(range(n_slices))
+            return np.arange(len(range(n_slices)), dtype=np.intp)
         elif slabel == 'sequential decreasing':
-            sp_ind_time_order = list(range(n_slices)[::-1])
+            return np.arange(len(range(n_slices)) - 1, -1, -1, dtype=np.intp)
         elif slabel == 'alternating increasing':
-            sp_ind_time_order = list(range(0, n_slices, 2)) + list(range(1, n_slices, 2))
+            first = range(0, n_slices, 2)
+            second = range(1, n_slices, 2)
         elif slabel == 'alternating decreasing':
-            sp_ind_time_order = list(range(n_slices - 1, -1, -2)) + list(
-                range(n_slices - 2, -1, -2)
-            )
+            first = range(n_slices - 1, -1, -2)
+            second = range(n_slices - 2, -1, -2)
         elif slabel == 'alternating increasing 2':
-            sp_ind_time_order = list(range(1, n_slices, 2)) + list(range(0, n_slices, 2))
+            first = range(1, n_slices, 2)
+            second = range(0, n_slices, 2)
         elif slabel == 'alternating decreasing 2':
-            sp_ind_time_order = list(range(n_slices - 2, -1, -2)) + list(
-                range(n_slices - 1, -1, -2)
-            )
+            first = range(n_slices - 2, -1, -2)
+            second = range(n_slices - 1, -1, -2)
         else:
             raise HeaderDataError(f'We do not handle slice ordering "{slabel}"')
-        return np.argsort(sp_ind_time_order)
+        # Assign each acquisition group's ranks directly to its slice positions.
+        n_first = len(first)
+        n_slices = n_first + len(second)
+        order = np.empty(n_slices, dtype=np.intp)
+        ranks = np.arange(n_slices, dtype=np.intp)
+        if first:
+            order[first.start :: first.step] = ranks[:n_first]
+        if second:
+            order[second.start :: second.step] = ranks[n_first:]
+        return order
 
     def get_xyzt_units(self):
         xyz_code = self.structarr['xyzt_units'] % 8
